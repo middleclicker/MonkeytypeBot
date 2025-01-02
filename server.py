@@ -21,12 +21,47 @@ finger_tracker = {
     'right_2': 'j', 'right_3': 'k', 'right_4': 'l', 'right_5': ';', 'right_1': 'n'
 }
 
-base_delay = 60 / 150 / 5 / 3
+# Config
+SERVER_PORT = 8001
+BASE_DELAY = 60 / 150 / 5 / 3 # 60 / WPM / Avg. word length / Random factor
+DEFAULT_DELAY = 0.08
+DISTANCE_FACTOR = 0.01
+DELAY_SAME_KEY_MIN = 0.016
+DELAY_SAME_KEY_MAX = 0.030
+DISTANCE_RAND_MUL_MIN = 0.7
+DISTANCE_RAND_MUL_MAX = 1.2
+BASE_FATIGUE = 1.0
+MAX_FATIGUE = 1.5
+FATIGUE_INCR = 0.001
+FATIGUE_RAND_ADD_MIN = 0.0005
+FATIGUE_RAND_ADD_MAX = 0.002
+MISTAKE_CHANCE = 0.01  # 1% chance of making a mistake
+HOLD_TIME_SPECIAL_MIN = 0.05
+HOLD_TIME_SPECIAL_MAX = 0.07
+HOLD_TIME_SPACE_MIN = 0.02
+HOLD_TIME_SPACE_MAX = 0.05
+HOLD_TIME_NORMAL_MIN = 0.02
+HOLD_TIME_NORMAL_MAX = 0.04
+
+class FatigueManager:
+    def __init__(self):
+        self.factor = BASE_FATIGUE
+        self.increment = FATIGUE_INCR
+        self.max_factor = MAX_FATIGUE
+
+    def update_fatigue(self):
+        self.factor += random.uniform(FATIGUE_RAND_ADD_MIN, FATIGUE_RAND_ADD_MAX)
+        self.factor = min(self.factor, self.max_factor)
+
+    def reset_fatigue(self):
+        self.factor = BASE_FATIGUE
+
+fatigue_manager = FatigueManager()
 
 def calculate_delay(prev_char, current_char):
     """Calculate delay based on the position of the keys."""
     if prev_char not in keyboard_layout or current_char not in keyboard_layout:
-        return 0.08
+        return DEFAULT_DELAY
 
     prev_pos = keyboard_layout[prev_char]
 
@@ -61,13 +96,23 @@ def calculate_delay(prev_char, current_char):
         current_pos = prev_pos
 
     distance = ((current_pos[0] - prev_pos[0]) ** 2 + (current_pos[1] - prev_pos[1]) ** 2) ** 0.5
-
     if distance == 0:
-        delay = random.uniform(0.016, 0.030)
+        delay = random.uniform(DELAY_SAME_KEY_MIN, DELAY_SAME_KEY_MAX)
     else:
-        delay = random.uniform(0.7, 1.2) * (distance * 0.01)
+        delay = random.uniform(DISTANCE_RAND_MUL_MIN, DISTANCE_RAND_MUL_MAX) * distance * DISTANCE_FACTOR
 
-    return base_delay + delay
+    delay = (BASE_DELAY + delay) * fatigue_manager.factor * random.uniform(0.8, 1)  # Adjust delay with fatigue
+
+    return delay
+
+def calculate_hold_time(char):
+    if char in ['.', ',', ';', ':', '?', '!']:
+        hold_time = random.uniform(HOLD_TIME_SPECIAL_MIN, HOLD_TIME_SPECIAL_MAX)  # Slightly longer for punctuation
+    elif char == ' ':
+        hold_time = random.uniform(HOLD_TIME_SPACE_MIN, HOLD_TIME_SPACE_MAX)  # Space bar is held slightly longer
+    else:
+        hold_time = random.uniform(HOLD_TIME_NORMAL_MIN, HOLD_TIME_NORMAL_MAX)  # Regular keys
+    return hold_time
 
 async def press_key_with_overlap(char, hold_time, fatigue_factor):
     """Simulate pressing a key with overlapping presses and fatigue."""
@@ -77,25 +122,19 @@ async def press_key_with_overlap(char, hold_time, fatigue_factor):
     py.keyUp(char)
     logging.info(f"Key '{char}' held for {adjusted_hold_time:.3f} seconds.")
 
-async def make_mistake(current_char):
-    """Simulate a mistake by pressing an incorrect key."""
-    mistake_type = random.choice(['skip', 'incorrect'])
-
-    if mistake_type == 'skip':
-        logging.info("Mistake: Skipping key press.")
-        return None  # Skip the key press
-    else:
-        # Simulate incorrect key press
-        incorrect_char = random.choice(list(keyboard_layout.keys()))
-        logging.info(f"Mistake: Pressing incorrect key '{incorrect_char}' instead of '{current_char}'.")
-        return incorrect_char  # Return the incorrect character to press
+async def simulate_mistake(current_char):
+    if random.random() < MISTAKE_CHANCE and current_char != ' ':
+        mistake_type = random.choice(["Skip", "Incorrect"])
+        if mistake_type == "Skip":
+            return None  # No key press
+        elif mistake_type == "Incorrect":
+            incorrect_char = random.choice(list(keyboard_layout.keys()))
+            return incorrect_char  # Incorrect key
+    return None  # No mistake
 
 async def handler(websocket):
+    global fatigue_manager
     prev_char = None
-    fatigue_factor = 1.000  # Start with no fatigue
-    total_chars_typed = 0  # Keep track of the total characters typed
-    fatigue_increment = 0.001  # Amount by which fatigue increases per character
-    mistake_chance = 0.01  # 2% chance of making a mistake
     last_key_time = time.time()  # Track the last key press time
 
     try:
@@ -106,40 +145,27 @@ async def handler(websocket):
                 word += ' '
                 tasks = []  # Store tasks to manage overlapping key presses
                 for char in word:
-                    total_chars_typed += 1
-
                     # Check if the time since the last key press is too long
                     current_time = time.time()
                     time_diff = current_time - last_key_time
 
                     if time_diff > 1:  # Reset fatigue if time since last key press > 1 second
                         logging.info("Time gap exceeded 1 second. Resetting fatigue.")
-                        fatigue_factor = 1  # Reset fatigue
+                        fatigue_manager.reset_fatigue()
 
                     # Check for a mistake
-                    if random.random() < mistake_chance and char != ' ':
-                        mistaken_char = await make_mistake(char)
-                        if mistaken_char is None:
-                            continue  # Skip this character if it's a skipped mistake
-                        else:
-                            char = mistaken_char  # Replace with the incorrect key
+                    mistake = await simulate_mistake(char)
+                    if mistake == "Skip":
+                        continue
+                    elif mistake != None:
+                        char = mistaken_char
 
-                    # Increment fatigue factor gradually
-                    fatigue_factor += random.uniform(0.0005, 0.002)  # Random increment
-                    fatigue_factor = min(fatigue_factor, 1.5)  # Cap fatigue to prevent extreme slowness
-
-                    delay = calculate_delay(prev_char, char) * fatigue_factor * random.uniform(0.8, 1)  # Adjust delay with fatigue
-                    logging.info(f"Delay: {delay}")
-                    # Determine the hold time for the current character
-                    if char in ['.', ',', ';', ':', '?', '!']:
-                        hold_time = random.uniform(0.05, 0.07)  # Slightly longer for punctuation
-                    elif char == ' ':
-                        hold_time = random.uniform(0.02, 0.05)  # Space bar is held slightly longer
-                    else:
-                        hold_time = random.uniform(0.02, 0.04)  # Regular keys
+                    fatigue_manager.update_fatigue()
+                    delay = calculate_delay(prev_char, char)
+                    hold_time = calculate_hold_time(char)
 
                     # Schedule the key press as an asynchronous task
-                    tasks.append(asyncio.create_task(press_key_with_overlap(char, hold_time, fatigue_factor)))
+                    tasks.append(asyncio.create_task(press_key_with_overlap(char, hold_time, fatigue_manager.factor)))
 
                     # Wait for the delay before pressing the next key
                     await asyncio.sleep(delay)
@@ -148,7 +174,7 @@ async def handler(websocket):
 
                 # Wait for all key press tasks to complete
                 await asyncio.gather(*tasks)
-                logging.info(f"Typing completed for word: {word.strip()}. Total characters typed: {total_chars_typed}, Fatigue factor: {fatigue_factor}")
+                logging.info(f"Typing completed for word: {word.strip()}. Fatigue factor: {fatigue_manager.factor}")
             elif message == "New Test":
                 py.press("tab")
                 await asyncio.sleep(2)
@@ -162,7 +188,7 @@ async def handler(websocket):
 
 async def main():
     logging.info("Starting server on port 8001")
-    async with serve(handler, "", 8001):
+    async with serve(handler, "", SERVER_PORT):
         await asyncio.get_running_loop().create_future()  # run forever
 
 if __name__ == "__main__":
